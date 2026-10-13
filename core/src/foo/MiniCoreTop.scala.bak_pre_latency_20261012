@@ -1,0 +1,356 @@
+package mini.foo
+
+import chisel3._
+import chisel3.util._
+import qdma._
+import cmac._
+import common._
+import common.storage._
+import common.axi._
+import generator.SlicerFrontend
+import mini.core._
+import mini.junctions._
+
+/** Standalone Alveo U200 top.
+  *
+  * Unlike Foo/AlveoDynamicTop, this top instantiates the physical QDMA IP and
+  * exports only real board pins. It does not require an Alveo static shell.
+  */
+class MiniCoreTop (enableDebug: Boolean = false) extends RawModule {
+  override val desiredName = "MiniCoreTop"
+
+  val qdma_pin = IO(new QDMAPin(16))
+  val cmac0_pin = IO(new CMACPin())
+  val cmac1_pin = IO(new CMACPin())
+  val sys_156M_0_p = IO(Input(Clock()))
+  val sys_156M_0_n = IO(Input(Clock()))
+  val led = IO(Output(UInt(1.W)))
+
+  val sys_156M_clk = IBUFDS(sys_156M_0_p, sys_156M_0_n)
+
+  // Same known-good 200 MHz application clock and 100 MHz debug clock used by
+  // the standalone QDMATop reference design.
+  val mmcm = Module(new MMCME4_ADV_Wrapper(
+    CLKFBOUT_MULT_F = 32,
+    MMCM_DIVCLK_DIVIDE = 5,
+    MMCM_CLKOUT0_DIVIDE_F = 5,
+    MMCM_CLKOUT1_DIVIDE_F = 10,
+    MMCM_CLKIN1_PERIOD = 6.4
+  ))
+  mmcm.io.CLKIN1 := sys_156M_clk
+  mmcm.io.RST := 0.U
+
+  val userClk = BUFG(mmcm.io.CLKOUT0)
+  val debugClk = BUFG(mmcm.io.CLKOUT1)
+  val userRstn = mmcm.io.LOCKED
+  dontTouch(debugClk)
+
+  // Use the same 200 MHz application clock for slicer0, CMAC RX, and RXcore.
+  val cmac = Module(new CMACTop(
+    ENABLE_DEBUG = enableDebug,
+    USE_EXTERNAL_CLOCK = true
+  ))
+  cmac.cmac0_pin <> cmac0_pin
+  cmac.cmac1_pin <> cmac1_pin
+  cmac.external_user_clk.get := userClk
+  cmac.external_user_rstn.get := userRstn
+  cmac.sys_clk := sys_156M_clk
+  led := cmac.led
+
+  for (i <- 0 until 2) {
+    cmac.s_net_tx(i).valid := false.B
+    cmac.s_net_tx(i).bits :=
+      0.U.asTypeOf(new AXIS(512))
+  }
+
+  // CMAC0 RX is unused. CMAC1 RX feeds the frontend in the shared user clock.
+  cmac.m_net_rx(0).ready := true.B
+
+  val qdma = Module(new QDMA(
+    VIVADO_VERSION = "202501",
+    PCIE_WIDTH = 16,
+    SLAVE_BRIDGE = false,
+    BRIDGE_BAR_SCALE = "Megabytes",
+    BRIDGE_BAR_SIZE = 4
+  ))
+  qdma.getTCL()
+  qdma.io.pin <> qdma_pin
+  qdma.io.user_clk := userClk
+  qdma.io.user_arstn := userRstn
+
+  withClockAndReset(userClk, !userRstn) {
+    ToZero(qdma.io.reg_status)
+
+    qdma.io.axib := DontCare
+
+    val reg_control = qdma.io.reg_control
+    val reg_status = qdma.io.reg_status
+    val qdma_h2c_cmd = qdma.io.h2c_cmd
+    val qdma_h2c_data = qdma.io.h2c_data
+
+    val h2c = Module(new H2CWithAXI())
+    h2c.io.h2c_cmd.ready := DontCare
+    h2c.io.hbmCtrlAw.ready := DontCare
+
+    val count_send_word_h2c = RegInit(0.U(32.W))
+
+    when(qdma_h2c_data.fire) {
+      count_send_word_h2c := count_send_word_h2c + 1.U
+    }
+
+    h2c.io.cur_word := count_send_word_h2c
+    //H2CWithAXI was not inst
+    h2c.io.start_addr := Cat(reg_control(100), reg_control(101))
+    h2c.io.length := reg_control(102)
+    h2c.io.offset := reg_control(103)
+    h2c.io.sop := reg_control(104)
+    h2c.io.eop := reg_control(105)
+    h2c.io.start := reg_control(106)
+    h2c.io.total_words := reg_control(107)
+    h2c.io.total_qs := reg_control(108)
+    h2c.io.total_cmds := reg_control(109)
+    h2c.io.range := reg_control(110)
+    h2c.io.range_words := reg_control(111)
+    h2c.io.is_seq := reg_control(112)
+    h2c.io.target_addr := reg_control(114)
+
+    for (i <- 0 until 16) {
+      h2c.io.count_word(i * 32 + 31, i * 32) <> reg_status(102 + i)
+    }
+    h2c.io.count_err <> reg_status(100)
+    h2c.io.count_time <> reg_status(101)
+
+    // c2h.io.start_addr := Cat(reg_control(200), reg_control(201))
+    // c2h.io.length := reg_control(202)
+    // c2h.io.offset := reg_control(203)
+    // c2h.io.start := reg_control(204)
+    // c2h.io.total_words := reg_control(205)
+    // c2h.io.total_qs := reg_control(206)
+    // c2h.io.total_cmds := reg_control(207)
+    // c2h.io.pfch_tag := reg_control(209)
+    // c2h.io.tag_index := reg_control(210)
+    // c2h.io.target_addr := reg_control(214)
+    // c2h.io.count_cmd <> reg_status(200)
+    // c2h.io.count_word <> reg_status(201)
+    // c2h.io.count_time <> reg_status(202)
+
+    Collector.connect_to_status_reg(reg_status, 400)
+
+    // Keep the hot-load and packet-processing datapath at the board top.  The
+    // former ChunkLoadSimTop remains a standalone simulation harness only.
+    val loader = Module(new hotloading())
+    val frontend = Module(new SlicerFrontend())
+    val rxMeta = Module(new RX_Meta(initFile = "inst_tx.mem"))
+    val profiler = Module(new PacketRateProfiler(cyclesPerUs = 200))
+
+    // Version-change auto-load transferred from ChunkLoadSimTop.  A nonzero
+    // version write queues one complete H2C load; it becomes active only after
+    // cmd+data transfer and VRT commit.  reg 215 bit 0 is an optional manual
+    // load trigger (core4nic-style).  cpu_reset is held high during load.
+    val cpuLoadSafe = rxMeta.io.load_safe
+    val manualStart = reg_control(215)(0)
+    val version = reg_control(220)(VRTConfig.VersionWidth - 1, 0)
+    val hostAddr = Cat(reg_control(216), reg_control(217))
+    val length = reg_control(218)
+    val imemBase = reg_control(219)
+    val page = reg_control(221)(VRTConfig.IndexWidth - 1, 0)
+    val shadow = reg_control(222)(VRTConfig.IndexWidth - 1, 0)
+    val vrtEnable = reg_control(223)(0)
+
+    val seenRequestedVersion = RegInit(0.U(VRTConfig.VersionWidth.W))
+    val pendingValid = RegInit(false.B)
+    val pendingVersion = RegInit(0.U(VRTConfig.VersionWidth.W))
+    val pendingHostAddr = RegInit(0.U(64.W))
+    val pendingImemBase = RegInit(0.U(32.W))
+    val pendingLength = RegInit(0.U(32.W))
+    val pendingPage = RegInit(0.U(VRTConfig.IndexWidth.W))
+    val pendingShadow = RegInit(0.U(VRTConfig.IndexWidth.W))
+    val pendingVrtEnable = RegInit(false.B)
+    val loadInFlight = RegInit(false.B)
+    val loadVersion = RegInit(0.U(VRTConfig.VersionWidth.W))
+    val activeVersion = RegInit(0.U(VRTConfig.VersionWidth.W))
+
+    val requestedVersionValid = version =/= 0.U
+    val requestedVersionChanged = version =/= seenRequestedVersion
+    val manualStartAccepted = manualStart && loader.io.ready && cpuLoadSafe
+    when(requestedVersionValid && requestedVersionChanged) {
+      seenRequestedVersion := version
+      when(manualStartAccepted) {
+        pendingValid := false.B
+      }.otherwise {
+        pendingValid := true.B
+        pendingVersion := version
+        pendingHostAddr := hostAddr
+        pendingImemBase := imemBase
+        pendingLength := length
+        pendingPage := page
+        pendingShadow := shadow
+        pendingVrtEnable := vrtEnable
+      }
+    }
+
+    val autoStart = pendingValid && loader.io.ready && !manualStart && cpuLoadSafe
+    val loaderStart = (manualStart || autoStart) && cpuLoadSafe
+    val loaderStartAccepted = loaderStart && loader.io.ready
+
+    when(loaderStartAccepted) {
+      loadInFlight := true.B
+      when(autoStart) {
+        loadVersion := pendingVersion
+        pendingValid := false.B
+      }.otherwise {
+        loadVersion := version
+        when(pendingValid && pendingVersion === version) {
+          pendingValid := false.B
+        }
+      }
+    }
+
+    when(loadInFlight && loader.io.done) {
+      activeVersion := loadVersion
+      loadInFlight := false.B
+    }
+
+    loader.io.loading_start := loaderStart
+    loader.io.host_mem_addr := Mux(autoStart, pendingHostAddr, hostAddr)
+    loader.io.mem_length := Mux(autoStart, pendingLength, length)
+    loader.io.imem_base_addr := Mux(autoStart, pendingImemBase, imemBase)
+    loader.io.version := Mux(autoStart, pendingVersion, version)
+    loader.io.page_idx := Mux(autoStart, pendingPage, page)
+    loader.io.shadow_slot := Mux(autoStart, pendingShadow, shadow)
+    loader.io.vrt_update_enable := Mux(autoStart, pendingVrtEnable, vrtEnable)
+    loader.io.h2c_cmd <> qdma_h2c_cmd
+    loader.io.h2c_data <> qdma_h2c_data
+
+    rxMeta.io.cpu_reset := loader.io.core_started
+    rxMeta.io.imem_addr := loader.io.imem_addr
+    rxMeta.io.imem_wr_en := loader.io.imem_wr_en
+    rxMeta.io.imem_musk := loader.io.imem_musk
+    rxMeta.io.imem_data_in := loader.io.imem_data_in
+    rxMeta.io.vrt_update <> loader.io.vrt_update
+    rxMeta.io.axi := DontCare
+
+    // One control bit owns both continuous packet generation and the profiler
+    // start edge.  There is no second packet-start register in hardware.
+    val slicerStart = reg_control(224)(0)
+    val slicerStartPrev = RegNext(slicerStart, false.B)
+    val slicerStartPulse = slicerStart && !slicerStartPrev
+    val durationCycles = Mux(reg_control(233) === 0.U,
+      40000.U(32.W), reg_control(233))
+    val trafficCycle = RegInit(0.U(32.W))
+    val launchActive = slicerStart &&
+      (slicerStartPulse || trafficCycle < (durationCycles - 1.U))
+    when(slicerStartPulse) {
+      trafficCycle := 1.U
+    }.elsewhen(slicerStart && trafficCycle < durationCycles) {
+      trafficCycle := trafficCycle + 1.U
+    }
+    if (!enableDebug) {
+      cmac.generator_start.get := VecInit(launchActive, false.B)
+    }
+    cmac.payload_len := VecInit(reg_control(227)(15, 0), 0.U(16.W))
+    cmac.idle_cycle := VecInit(reg_control(228)(7, 0), 0.U(8.W))
+    cmac.generator_qpn.get := VecInit(Mux(
+      activeVersion =/= 0.U,
+      activeVersion,
+      reg_control(230)(VRTConfig.VersionWidth - 1, 0)
+    ), 0.U(24.W))
+    frontend.io.s_axis <> cmac.m_net_rx(1)
+
+    rxMeta.io.meta_in <> frontend.io.meta_out
+    rxMeta.io.meta_out.ready := true.B
+    frontend.io.m_axis.ready := true.B
+
+    profiler.io.start := slicerStart
+    profiler.io.processed := rxMeta.io.meta_out.fire
+    profiler.io.residual_count := Mux(rxMeta.io.meta_queue_count > 1023.U,
+      1023.U, rxMeta.io.meta_queue_count(9, 0))
+    profiler.io.host_addr := Cat(reg_control(225), reg_control(226))
+    profiler.io.c2h_cmd <> qdma.io.c2h_cmd
+    profiler.io.c2h_data <> qdma.io.c2h_data
+
+    // Validate the payload produced after the 70-byte header is removed.
+    val payloadBytesInPacket = RegInit(0.U(32.W))
+    val expectedPayloadBytes = RegInit(0.U(16.W))
+    val payloadInPacket = RegInit(false.B)
+    val payloadPacketsChecked = RegInit(0.U(32.W))
+    val payloadLengthErrors = RegInit(0.U(32.W))
+    val lastPayloadBytes = RegInit(0.U(32.W))
+    when(frontend.io.m_axis.fire) {
+      val actualBytes = payloadBytesInPacket + PopCount(frontend.io.m_axis.bits.keep)
+      val expectedBytes = Mux(
+        payloadInPacket,
+        expectedPayloadBytes,
+        reg_control(227)(15, 0)
+      )
+      when(!payloadInPacket) {
+        expectedPayloadBytes := reg_control(227)(15, 0)
+        payloadInPacket := true.B
+      }
+      when(frontend.io.m_axis.bits.last.asBool) {
+        lastPayloadBytes := actualBytes
+        payloadPacketsChecked := payloadPacketsChecked + 1.U
+        when(actualBytes =/= expectedBytes) {
+          payloadLengthErrors := payloadLengthErrors + 1.U
+        }
+        payloadBytesInPacket := 0.U
+        payloadInPacket := false.B
+      }.otherwise {
+        payloadBytesInPacket := actualBytes
+      }
+    }
+
+    // IMEM and H2C payload visibility belongs in ILAs, not the status-register
+    // map.  Handshake probes make command/data timing unambiguous.
+    // These two loader probes are intentionally independent of enableDebug;
+    // CMAC and other general-purpose debug cores remain disabled by default.
+    class ila_imem_hotload(seq: Seq[Data]) extends BaseILA(seq)
+    val imemHotloadIla = Module(new ila_imem_hotload(Seq(
+      loader.io.imem_wr_en,
+      loader.io.imem_addr,
+      loader.io.imem_data_in,
+      rxMeta.io.debug_pc,         // Actual dpath.pc logical fetch-PC register.
+      loader.io.loading_start,   // Accepted chunk-load start, not the host request.
+      rxMeta.io.cpu_reset        // Loader-held reset (high during load).
+    )))
+    imemHotloadIla.connect(userClk)
+
+    class ila_h2c_hotload(seq: Seq[Data]) extends BaseILA(seq)
+    val h2cHotloadIla = Module(new ila_h2c_hotload(Seq(
+      loader.io.h2c_cmd.valid,
+      loader.io.h2c_cmd.ready,
+      loader.io.h2c_cmd.bits.addr,
+      loader.io.h2c_cmd.bits.len,
+      loader.io.h2c_data.valid,
+      loader.io.h2c_data.ready,
+      loader.io.h2c_data.bits.data,
+      loader.io.h2c_data.bits.last
+    )))
+    h2cHotloadIla.connect(userClk)
+
+    reg_status(300) := rxMeta.io.rdma_print_addr
+    reg_status(301) := rxMeta.io.rdma_print_string_num
+    reg_status(302) := rxMeta.io.rdma_print_string_len
+    reg_status(303) := rxMeta.io.rdma_trap
+    reg_status(304) := Cat(0.U(30.W), profiler.io.busy, profiler.io.done)
+    reg_status(305) := profiler.io.samples_captured
+    reg_status(306) := rxMeta.io.event_processed_cnt
+    reg_status(307) := payloadPacketsChecked
+    reg_status(308) := payloadLengthErrors
+    reg_status(309) := lastPayloadBytes
+    reg_status(310) := activeVersion
+    reg_status(311) := Cat(
+      0.U(30.W), loader.io.busy, pendingValid || loadInFlight
+    )
+    // Current FIFO occupancy, not the cumulative number of generated packets.
+    reg_status(312) := rxMeta.io.meta_queue_count
+    // Firmware-owned CSR 0x093; distinct from the event completion counter.
+    reg_status(313) := rxMeta.io.event_count
+    // Static two-word ABI identifiers: reject old bitstreams before C2H.
+    reg_status(314) := "h51500001".U(32.W)
+    reg_status(315) := 200.U(32.W)
+    reg_status(318) := trafficCycle
+    reg_status(352) := cmac.cmac1_rx_aligned.asUInt
+    reg_status(353) := "h434d4143".U(32.W)
+  }
+}

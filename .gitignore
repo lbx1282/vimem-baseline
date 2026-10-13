@@ -1,0 +1,24 @@
+# build / elaboration artifacts
+out/
+Verilog/
+/gen/
+/results/
+
+# Vivado / sim logs
+/.Xil/
+vivado.jou
+vivado.log
+xvlog.pb
+*.jou
+
+# shared modules: symlinks into core4nic, recreate on checkout
+/cmac
+/hbm
+/qdma
+
+# codex backup
+/.codex-backup*/
+
+# python
+__pycache__/
+*.pyc

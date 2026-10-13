@@ -1,0 +1,7 @@
+{
+  "mini": {
+    "destIPRepoPath": "/home/lbx/prj/prj_baseline_hotloading/prj_baseline_hotloading.srcs/sources_1/ip",
+    "destSrcPath": "/home/lbx/prj/prj_baseline_hotloading/prj_baseline_hotloading.srcs/sources_1/new",
+    "moniterDelay": 6
+  }
+}
